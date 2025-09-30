@@ -5,8 +5,6 @@ import math
 import json
 import importlib, importlib.util, sys, os
 
-diff = 1
-
 def fun(SEED) :
     # We will try to import a module named MST_NEW or load it from
     # a relative path “experiment/MST_NEW.py”. A helper function
@@ -18,17 +16,17 @@ def fun(SEED) :
     N = 125
     DOMAIN = (0.0, 1.0, 0.0, 1.0)
 
-    DSC_RANGE = (8000, 12000)
-    IGC_RANGE = (3000, 6000)
-    UNIT_COST_RANGE = (250.0, 600.0)
+    DSC_RANGE = (9000, 15000)
+    IGC_RANGE = (4000, 9000)
+    UNIT_COST_RANGE = (40000, 60000)
 
     NUM_FLAT_REGIONS = 2
-    REGION_R_RANGE = (0.18, 0.25)
+    REGION_R_RANGE = (0.16, 0.22)
     REGION_PAD = 0.01
     REGION_GAP = 0.002
 
-    ST_COST_RANGE = (150.0, 500.0)
-    SUBSTATION_COST_RANGE = (6000.0, 12000.0)
+    ST_COST_RANGE = (150.0, 600.0)
+    SUBSTATION_COST_RANGE = (6000.0, 10000.0)
 
     # We sample N points in the unit square and assign costs:
     # DSC (decentralized cost), IGC (internal centralized cost), and a
@@ -256,7 +254,7 @@ def fun(SEED) :
 
     # This second figure overlays the region circles on top of the
     # baseline network so you can see where terminals live.
-    theta = np.linspace(0.0, 2.0*np.pi, 400)
+    theta = np.linspace(0.0, 2.0*np.pi, 400) 
     fig = plt.figure(figsize=(7,7))
     for _, erow in edges_df.iterrows():
         u, v = int(erow.u), int(erow.v)
@@ -469,6 +467,12 @@ def fun(SEED) :
             continue
         x1, y1 = points[u]; x2, y2 = points[v]
         plt.plot([x1, x2], [y1, y2])
+    
+    # --- NEW: connectivity of baseline using only edges NOT fully inside eligible regions ---
+    dsu_outside = DSU(N)
+    for (u, v, _) in kept:
+        if not edge_entirely_inside_any_eligible_region(u, v):
+            dsu_outside.union(u, v)
 
     # Scatter nodes (unchanged) so we can see centralized vs decentralized.
     cen_mask = nodes_df["centralized"].values.astype(bool)
@@ -477,16 +481,20 @@ def fun(SEED) :
     plt.scatter(points[cen_mask,0], points[cen_mask,1], s=40, label="Centralized")
 
     # For each region, draw the boundary and attempt Steiner rewiring.
+    # --- REPLACE START: component-aware regional Steiner wiring ---
     theta = np.linspace(0.0, 2.0*np.pi, 400)
+    used_rep_terminals = set()   # we'll use this later for the "Terminals in trees" count
+
     for reg in regions_df.itertuples(index=False):
         cx, cy, r = float(reg.cx), float(reg.cy), float(reg.r)
         plt.plot(cx + r*np.cos(theta), cy + r*np.sin(theta))
 
-        dx = xs - cx
-        dy = ys - cy
+        # terminals inside region
+        dx = xs - cx; dy = ys - cy
         inside_mask = (dx*dx + dy*dy) <= (r*r)
         term_idx = np.where(inside_mask & cen_mask)[0]
         if term_idx.size < 2:
+            # record any singletons (optional)
             for nid in term_idx:
                 steiner_points_rows.append({
                     "region_id": int(reg.region_id),
@@ -497,10 +505,39 @@ def fun(SEED) :
                 })
             continue
 
-        terminals_xy = points[term_idx, :]  # (m,2)
+        # group by OUTSIDE component id
+        by_root = {}
+        for nid in map(int, term_idx):
+            root = dsu_outside.find(nid)
+            by_root.setdefault(root, []).append(nid)
+
+        # choose one representative per distinct outside component (closest to region center)
+        rep_ids = []
+        for ids in by_root.values():
+            arr = np.array(ids, dtype=int)
+            # pick the one closest to the region center to help Steiner geometry
+            best = int(arr[np.argmin((xs[arr]-cx)**2 + (ys[arr]-cy)**2)])
+            rep_ids.append(best)
+
+        if len(rep_ids) < 2:
+            # all terminals in this region already belong to one outside component
+            # (nothing to connect here)
+            for nid in rep_ids:
+                steiner_points_rows.append({
+                    "region_id": int(reg.region_id),
+                    "kind": "terminal",
+                    "orig_node_id": int(nid),
+                    "x": float(xs[nid]), "y": float(ys[nid])
+                })
+                used_rep_terminals.add(int(nid))
+            continue
+
+        # run Steiner only on the representatives (one per component)
+        terminals_xy = points[np.array(rep_ids, dtype=int), :]
         steiner_edges_coords, steiner_pts_xy = _run_steiner_via_mst_new(terminals_xy)
 
-        for nid in term_idx:
+        # record rep terminals actually used
+        for nid in rep_ids:
             steiner_points_rows.append({
                 "region_id": int(reg.region_id),
                 "kind": "terminal",
@@ -508,6 +545,9 @@ def fun(SEED) :
                 "x": float(xs[nid]),
                 "y": float(ys[nid])
             })
+            used_rep_terminals.add(int(nid))
+
+        # record any produced Steiner points
         for sp in steiner_pts_xy:
             steiner_points_rows.append({
                 "region_id": int(reg.region_id),
@@ -517,6 +557,7 @@ def fun(SEED) :
                 "y": float(sp[1])
             })
 
+        # record & draw edges for this region
         for (p1, p2) in steiner_edges_coords:
             steiner_edges_rows.append({
                 "region_id": int(reg.region_id),
@@ -526,14 +567,13 @@ def fun(SEED) :
             plt.plot([p1[0], p2[0]], [p1[1], p2[1]])
 
     # Count how many terminals appear in any drawn tree (outside edges or region trees).
+    # Count: endpoints from outside edges + representatives used in regions
     terminals_from_outside_edges = {
         int(u) for (u, v, d) in kept if not edge_entirely_inside_any_eligible_region(u, v)
     } | {
         int(v) for (u, v, d) in kept if not edge_entirely_inside_any_eligible_region(u, v)
     }
-    terminals_from_regions = set()
-    for s in eligible_term_sets:
-        terminals_from_regions |= s
+    terminals_from_regions = set(used_rep_terminals)
 
     terminals_in_any_tree = terminals_from_outside_edges | terminals_from_regions
     num_terminals_in_any_tree = len(terminals_in_any_tree)
@@ -605,18 +645,37 @@ def fun(SEED) :
     )
 
     # Recount components after regional merging: outside edges + union all terminals inside each region.
+    # start from the same outside connectivity
     dsu_after = DSU(N)
     for (u, v, _) in kept:
         if not inside_same_eligible(u, v):
             dsu_after.union(u, v)
+
+    # now, per region, union only across DISTINCT outside components (via reps)
     for reg in regions_df.itertuples(index=False):
         cx, cy, r = float(reg.cx), float(reg.cy), float(reg.r)
         mask_inside = (xs - cx)**2 + (ys - cy)**2 <= (r**2)
         term_idx = np.where(mask_inside & mask_cen)[0]
-        if term_idx.size >= 2:
-            base = int(term_idx[0])
-            for t in term_idx[1:]:
-                dsu_after.union(base, int(t))
+        if term_idx.size < 2:
+            continue
+
+        by_root = {}
+        for nid in map(int, term_idx):
+            root = dsu_after.find(nid)   # same as dsu_outside here
+            by_root.setdefault(root, []).append(nid)
+
+        # pick one representative per root (use the same "closest to center" rule)
+        rep_ids = []
+        for ids in by_root.values():
+            arr = np.array(ids, dtype=int)
+            best = int(arr[np.argmin((xs[arr]-cx)**2 + (ys[arr]-cy)**2)])
+            rep_ids.append(best)
+
+        if len(rep_ids) >= 2:
+            base = rep_ids[0]
+            for t in rep_ids[1:]:
+                dsu_after.union(base, t)
+
     roots_after = {dsu_after.find(i) for i in range(N) if mask_cen[i]}
     num_substations_after = len(roots_after)
 
@@ -685,7 +744,4 @@ def fun(SEED) :
     ])
     compare_df.to_csv("tree_costs_comparison.csv", index=False)
 
-# for i in range(1722, 1000000):
-#     fun(i)
-
-fun(347)
+fun(1723)
